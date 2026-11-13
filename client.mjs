@@ -1,6 +1,6 @@
 // 随机池＋ · Folia 模组客户端
 // 宿主自带的「每首歌随机歌词动画」只在内建样式里挑（候选 = 全部样式表 ∩ 内建白名单），
-// 52Hz（rings）、跳一跳（jump-course）这类模组样式进不了池。
+// 由模组注册的歌词样式（第三方动画模组提供的那些）进不了池。
 // 本模组不改宿主，用公开 API 另建一套池：listModes 拿全部已注册样式（带 kind），
 // 监听 playback.songChanged / lyrics.loaded，切歌时 setMode 换一种，池内超过 1 种时不连着重复。
 //
@@ -38,8 +38,8 @@ const T = {
   reloadEn: 'Reload',
   emptyZh: '没有拿到样式清单',
   emptyEn: 'Style list unavailable',
-  hintZh: '宿主「设置→歌词动画→随机池」那页固定只有 17 个内建，模组样式进不去；52Hz、跳一跳这类模组样式只在本面板的池里。要立刻验证：点「仅模组」，下一首必定是 52Hz 或跳一跳。',
-  hintEn: 'The host settings page is fixed to 17 built-ins. Mod styles live only in this pool. Click "Mods only" to verify: the next song must use 52Hz or Jump.',
+  hintZh: '宿主「设置→歌词动画→随机池」那页固定只有 17 个内建，模组样式进不去；这类模组样式只在本面板的池里。要立刻验证：点「仅模组」，下一首必定是 模组样式。',
+  hintEn: 'The host settings page is fixed to 17 built-ins. Mod styles live only in this pool. Click "Mods only" to verify: the next song must use a mod-provided style.',
   builtinTagZh: '内建',
   builtinTagEn: 'built-in',
   modTagZh: '模组',
@@ -266,6 +266,15 @@ export default function activate(folium) {
     }
   }
 
+  // 清单重读放到切歌之后：listModes 会枚举全部样式，压在切歌瞬间会拖慢换样式
+  function scheduleRefresh(ms) {
+    if (state.refreshTimer) clearTimeout(state.refreshTimer);
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      refreshModes();
+    }, ms == null ? 1500 : ms);
+  }
+
   function refreshModes() {
     state.lastRefresh = Date.now();
     let raw;
@@ -378,26 +387,83 @@ export default function activate(folium) {
   }
 
   // ---------- 抽选与切换 ----------
+  // 以前是「均匀随机，只排掉当前这一个」：19 个样式里，隔两三首又撞上同一个是常态，
+  // 看着就像随机不随机。改成洗牌袋（Fisher–Yates）：一整轮里每个样式各出现一次，
+  // 一轮用完再重洗，且新一轮的第一抽不与上一轮最后一抽相同 —— 既均匀，又不会连着撞。
+  function shuffleBag(list) {
+    const arr = list.slice();
+    for (let i = arr.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  function kindOf(id) {
+    for (let i = 0; i < state.modes.length; i += 1) {
+      if (state.modes[i].id === id) return state.modes[i].kind;
+    }
+    return '';
+  }
+
+  function nextFromBag(ids, excludeId) {
+    const sig = ids.join('|');
+    if (!state.bag || state.bag.sig !== sig) state.bag = { sig: sig, list: [] };
+    if (state.bag.list.length === 0) {
+      const fresh = shuffleBag(ids);
+      // 上一轮最后一个不能紧接着当这一轮的第一个：把撞上的那个换到队头（队尾取的是最后一个）
+      const last = state.lastPicked || excludeId;
+      if (fresh.length > 1 && last) {
+        const at = fresh.indexOf(last);
+        if (at === fresh.length - 1) {
+          fresh[at] = fresh[0];
+          fresh[0] = last;
+        }
+      }
+      state.bag.list = fresh;
+    }
+    let picked = state.bag.list.pop();
+    if (!picked) return null;
+    /*
+     * 再挡一道「刚用过」：袋里一共 19 个，跨轮交界那几抽仍可能撞上最近两首的样式。
+     * 撞上了就从袋里换一个不在最近名单里的（袋里还有别的可换时才换）。
+     */
+    const recent = state.recent = Array.isArray(state.recent) ? state.recent : [];
+    if (recent.indexOf(picked) !== -1 && state.bag.list.length > 0) {
+      const at = state.bag.list.findIndex((id) => recent.indexOf(id) === -1);
+      if (at !== -1) {
+        // 换下来的那个塞回队头，不能塞队尾：队尾是下一抽。
+        state.bag.list.unshift(picked);
+        picked = state.bag.list.splice(at + 1, 1)[0];
+      }
+    }
+    /*
+     * 池里同时有内建和模组样式时，每 4 抽至少强制一次模组样式，
+     * 否则 17/19 的概率下模组样式几乎看不见。
+     * （旧写法用 `id.indexOf('mod:')` 判模组，可宿主给的 id 并不带这个前缀，
+     *  这条强制其实从没生效过；现在按清单里的 kind 判。）
+     */
+    const mods = ids.filter((id) => kindOf(id) === 'mod');
+    if (mods.length > 0 && mods.length < ids.length) {
+      state.pickCount = (state.pickCount || 0) + 1;
+      if (kindOf(picked) !== 'mod' && state.pickCount % 4 === 0) {
+        const at = state.bag.list.findIndex((id) => kindOf(id) === 'mod');
+        if (at !== -1) picked = state.bag.list.splice(at, 1)[0];
+      }
+    }
+    recent.push(picked);
+    while (recent.length > 3) recent.shift();
+    state.lastPicked = picked;
+    return picked;
+  }
+
   function pick(excludeId) {
     const ids = poolIds();
     if (ids.length === 0) return null;
     if (ids.length === 1) return ids[0];
-    let pool = ids;
-    if (excludeId) {
-      const rest = ids.filter((id) => id !== excludeId);
-      if (rest.length > 0) pool = rest;
-    }
-    // 池里同时有内建和模组样式时，每 3 次至少强制一次模组样式，
-    // 否则 17/19 的概率下模组样式几乎看不见。
-    const mods = pool.filter((id) => id.indexOf('mod:') === 0);
-    if (mods.length > 0 && pool.length > mods.length) {
-      state.modGap = (state.modGap || 0) + 1;
-      if (state.modGap >= 3) {
-        state.modGap = 0;
-        return mods[Math.floor(Math.random() * mods.length)];
-      }
-    }
-    return pool[Math.floor(Math.random() * pool.length)];
+    return nextFromBag(ids, excludeId);
   }
 
   function now() {
@@ -423,22 +489,32 @@ export default function activate(folium) {
     const next = target || pick(currentId());
     if (!next) return;
     const from = currentId();
-    if (next === from) {
+    if (normId(next) === normId(from)) {
       log('skip same ' + next);
+      return;
+    }
+    // 上一次 setMode 还挂着（宿主正在重建样式），这时再写一次就是两个样式连着重装
+    if (state.applying) {
+      log('skip: 上一次 setMode 尚未落地');
       return;
     }
     const t0 = now();
     try {
       const r = V.setMode(next);
       if (isThenable(r)) {
+        state.applying = true;
         r.then(
           () => {
+            state.applying = false;
             state.cur = next;
             log('mode -> ' + next);
             pushHist({ at: new Date().toISOString(), from: from, id: next, ms: Math.round(now() - t0) });
             notify();
           },
-          (e) => log('setMode 失败: ' + errText(e))
+          (e) => {
+            state.applying = false;
+            log('setMode 失败: ' + errText(e));
+          }
         );
         return;
       }
@@ -451,6 +527,12 @@ export default function activate(folium) {
       pushHist({ at: new Date().toISOString(), from: from, id: next, err: errText(e) });
     }
     notify();
+  }
+
+  function normId(id) {
+    return String(id == null ? '' : id)
+      .toLowerCase()
+      .replace(/^(mod|builtin|visualizer)[:/]/, '');
   }
 
   function readCurrent(cb) {
@@ -493,8 +575,9 @@ export default function activate(folium) {
     state.fixes = 0;
     scheduleSwitch(() => {
       if (!state.cfg.enabled) return;
-      // 其它模组可能比本模组晚注册，切歌时若清单偏旧就重读一次
-      if (!state.modes.length || Date.now() - (state.lastRefresh || 0) > 20000) refreshModes();
+      // 其它模组可能比本模组晚注册；但 listModes 会枚举全部样式，不压在切歌这一帧里
+      if (!state.modes.length) refreshModes();
+      else if (Date.now() - (state.lastRefresh || 0) > 20000) scheduleRefresh(1500);
       const next = pick(currentId());
       if (!next) return;
       state.desired = next;
@@ -513,7 +596,7 @@ export default function activate(folium) {
       if (seq !== state.songSeq) return;
       readCurrent((cur) => {
         if (seq !== state.songSeq) return;
-        if (typeof cur !== 'string' || cur === state.desired) return;
+        if (typeof cur !== 'string' || normId(cur) === normId(state.desired)) return;
         if ((state.fixes || 0) >= 1) return;
         state.fixes = (state.fixes || 0) + 1;
         log('verify: ' + cur + ' -> ' + state.desired);
@@ -540,6 +623,15 @@ export default function activate(folium) {
   }
 
   function notify() {
+    // 切歌只更新状态行，不重建整个面板（重建 19 行 DOM 会在换歌瞬间卡一下）
+    if (typeof state.refreshStatus === 'function') {
+      try {
+        state.refreshStatus();
+        return;
+      } catch (e) {
+        /* 退回到整面板重绘 */
+      }
+    }
     if (typeof state.rerender === 'function') {
       try {
         state.rerender();
@@ -590,7 +682,6 @@ export default function activate(folium) {
       const modes = allModes();
       const chosen = poolIds();
       const cur = currentId();
-      const curItem = modes.filter((m) => m.id === cur)[0];
 
       const root = document.createElement('div');
       root.style.cssText =
@@ -618,16 +709,27 @@ export default function activate(folium) {
 
       const status = document.createElement('div');
       status.style.cssText = 'margin-left:auto;font-size:12px;opacity:0.7';
-      status.textContent =
-        (state.cfg.enabled ? t(T.onStateZh, T.onStateEn) : t(T.offStateZh, T.offStateEn)) +
-        ' · ' +
-        t(T.poolZh, T.poolEn) +
-        ' ' +
-        chosen.length +
-        '/' +
-        modes.length +
-        (cur ? ' · ' + t(T.curZh, T.curEn) + ' ' + (curItem ? curItem.label : cur) : '') +
-        (!state.ready ? ' · ' + t(T.loadingZh, T.loadingEn) : '');
+      const statusText = () => {
+        const ms = allModes();
+        const chosenIds = poolIds();
+        const curNow = currentId();
+        const item = ms.filter((m) => m.id === curNow)[0];
+        return (
+          (state.cfg.enabled ? t(T.onStateZh, T.onStateEn) : t(T.offStateZh, T.offStateEn)) +
+          ' · ' +
+          t(T.poolZh, T.poolEn) +
+          ' ' +
+          chosenIds.length +
+          '/' +
+          ms.length +
+          (curNow ? ' · ' + t(T.curZh, T.curEn) + ' ' + (item ? item.label : curNow) : '') +
+          (!state.ready ? ' · ' + t(T.loadingZh, T.loadingEn) : '')
+        );
+      };
+      status.textContent = statusText();
+      state.refreshStatus = () => {
+        status.textContent = statusText();
+      };
       head.appendChild(status);
       root.appendChild(head);
 
@@ -736,6 +838,7 @@ export default function activate(folium) {
 
     return () => {
       state.rerender = null;
+      state.refreshStatus = null;
       try {
         container.innerHTML = '';
       } catch (e) {
