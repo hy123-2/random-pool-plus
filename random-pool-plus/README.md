@@ -35,6 +35,7 @@ Folia 自带的「每首歌随机歌词动画」候选是「全部样式表 ∩ 
 ## 说明与限制
 
 - 切换样式走公开的 `visualizer.setMode`，等同于手动换样式；不写宿主文件、不改 `app.asar`，Folia 自更新不会冲掉。
+- 换歌尽量不卡：每首歌只在 `playback.songChanged` 那一瞬间写一次 `setMode`；`listModes` 的枚举挪到切歌后 1.5 秒做，不占切换那一帧；面板只更新顶部状态行，不重建列表；上一次 `setMode` 还没落地时不会重复写。
 - 池为空或只剩一种时保持不动；切向当前正在用的样式会跳过，不重复写入。
 - 配置存在主窗口 `localStorage` 的 `random-pool-plus.config.v2` 键（`{enabled, ids}`），`ids` 为 `null` 表示跟随全量清单。
 - 诊断键（只写 localStorage，失败不影响功能）：`random-pool-plus.ping`（启动时间）、`random-pool-plus.hist`（最近 12 次切换记录，含目标 id 与耗时）。

@@ -266,6 +266,15 @@ export default function activate(folium) {
     }
   }
 
+  // 清单重读放到切歌之后：listModes 会枚举全部样式，压在切歌瞬间会拖慢换样式
+  function scheduleRefresh(ms) {
+    if (state.refreshTimer) clearTimeout(state.refreshTimer);
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      refreshModes();
+    }, ms == null ? 1500 : ms);
+  }
+
   function refreshModes() {
     state.lastRefresh = Date.now();
     let raw;
@@ -480,22 +489,32 @@ export default function activate(folium) {
     const next = target || pick(currentId());
     if (!next) return;
     const from = currentId();
-    if (next === from) {
+    if (normId(next) === normId(from)) {
       log('skip same ' + next);
+      return;
+    }
+    // 上一次 setMode 还挂着（宿主正在重建样式），这时再写一次就是两个样式连着重装
+    if (state.applying) {
+      log('skip: 上一次 setMode 尚未落地');
       return;
     }
     const t0 = now();
     try {
       const r = V.setMode(next);
       if (isThenable(r)) {
+        state.applying = true;
         r.then(
           () => {
+            state.applying = false;
             state.cur = next;
             log('mode -> ' + next);
             pushHist({ at: new Date().toISOString(), from: from, id: next, ms: Math.round(now() - t0) });
             notify();
           },
-          (e) => log('setMode 失败: ' + errText(e))
+          (e) => {
+            state.applying = false;
+            log('setMode 失败: ' + errText(e));
+          }
         );
         return;
       }
@@ -508,6 +527,12 @@ export default function activate(folium) {
       pushHist({ at: new Date().toISOString(), from: from, id: next, err: errText(e) });
     }
     notify();
+  }
+
+  function normId(id) {
+    return String(id == null ? '' : id)
+      .toLowerCase()
+      .replace(/^(mod|builtin|visualizer)[:/]/, '');
   }
 
   function readCurrent(cb) {
@@ -550,8 +575,9 @@ export default function activate(folium) {
     state.fixes = 0;
     scheduleSwitch(() => {
       if (!state.cfg.enabled) return;
-      // 其它模组可能比本模组晚注册，切歌时若清单偏旧就重读一次
-      if (!state.modes.length || Date.now() - (state.lastRefresh || 0) > 20000) refreshModes();
+      // 其它模组可能比本模组晚注册；但 listModes 会枚举全部样式，不压在切歌这一帧里
+      if (!state.modes.length) refreshModes();
+      else if (Date.now() - (state.lastRefresh || 0) > 20000) scheduleRefresh(1500);
       const next = pick(currentId());
       if (!next) return;
       state.desired = next;
@@ -570,7 +596,7 @@ export default function activate(folium) {
       if (seq !== state.songSeq) return;
       readCurrent((cur) => {
         if (seq !== state.songSeq) return;
-        if (typeof cur !== 'string' || cur === state.desired) return;
+        if (typeof cur !== 'string' || normId(cur) === normId(state.desired)) return;
         if ((state.fixes || 0) >= 1) return;
         state.fixes = (state.fixes || 0) + 1;
         log('verify: ' + cur + ' -> ' + state.desired);
@@ -597,6 +623,15 @@ export default function activate(folium) {
   }
 
   function notify() {
+    // 切歌只更新状态行，不重建整个面板（重建 19 行 DOM 会在换歌瞬间卡一下）
+    if (typeof state.refreshStatus === 'function') {
+      try {
+        state.refreshStatus();
+        return;
+      } catch (e) {
+        /* 退回到整面板重绘 */
+      }
+    }
     if (typeof state.rerender === 'function') {
       try {
         state.rerender();
@@ -647,7 +682,6 @@ export default function activate(folium) {
       const modes = allModes();
       const chosen = poolIds();
       const cur = currentId();
-      const curItem = modes.filter((m) => m.id === cur)[0];
 
       const root = document.createElement('div');
       root.style.cssText =
@@ -675,16 +709,27 @@ export default function activate(folium) {
 
       const status = document.createElement('div');
       status.style.cssText = 'margin-left:auto;font-size:12px;opacity:0.7';
-      status.textContent =
-        (state.cfg.enabled ? t(T.onStateZh, T.onStateEn) : t(T.offStateZh, T.offStateEn)) +
-        ' · ' +
-        t(T.poolZh, T.poolEn) +
-        ' ' +
-        chosen.length +
-        '/' +
-        modes.length +
-        (cur ? ' · ' + t(T.curZh, T.curEn) + ' ' + (curItem ? curItem.label : cur) : '') +
-        (!state.ready ? ' · ' + t(T.loadingZh, T.loadingEn) : '');
+      const statusText = () => {
+        const ms = allModes();
+        const chosenIds = poolIds();
+        const curNow = currentId();
+        const item = ms.filter((m) => m.id === curNow)[0];
+        return (
+          (state.cfg.enabled ? t(T.onStateZh, T.onStateEn) : t(T.offStateZh, T.offStateEn)) +
+          ' · ' +
+          t(T.poolZh, T.poolEn) +
+          ' ' +
+          chosenIds.length +
+          '/' +
+          ms.length +
+          (curNow ? ' · ' + t(T.curZh, T.curEn) + ' ' + (item ? item.label : curNow) : '') +
+          (!state.ready ? ' · ' + t(T.loadingZh, T.loadingEn) : '')
+        );
+      };
+      status.textContent = statusText();
+      state.refreshStatus = () => {
+        status.textContent = statusText();
+      };
       head.appendChild(status);
       root.appendChild(head);
 
@@ -793,6 +838,7 @@ export default function activate(folium) {
 
     return () => {
       state.rerender = null;
+      state.refreshStatus = null;
       try {
         container.innerHTML = '';
       } catch (e) {
