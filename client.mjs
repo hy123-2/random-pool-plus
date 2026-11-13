@@ -5,9 +5,10 @@
 // 监听 playback.songChanged / lyrics.loaded，切歌时 setMode 换一种，池内超过 1 种时不连着重复。
 //
 // 0.7.26 / 0.7.28 双版本兼容：listModes / getMode / setMode 可能同步返回，也可能返回 Promise
-// （宿主按上下文用 RPC 包装），这里统一用 settle() 兼容；返回值不是数组时退回 registries.visualizers 取列表。
+// （宿主按上下文用 RPC 包装），这里统一用 settle() 兼容。
+// 配置只存在模组自己的数据文件里（folium.storage + filesystem.data），不碰宿主自己的 localStorage。
 
-const CONFIG_KEY = 'random-pool-plus.config.v2';
+const STORE_KEY = 'config';
 const SWITCH_DELAY_MS = 0;
 const VERIFY_DELAY_MS = 700;
 
@@ -102,14 +103,16 @@ export default function activate(folium) {
     return;
   }
 
-  // 运行心跳：证明客户端确实被宿主加载并执行（排查用，失败不影响功能）
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      window.localStorage.setItem('random-pool-plus.ping', new Date().toISOString());
+  // 配置存档：folium.storage（模组自己的数据文件，对应 filesystem.data 权限）
+  const storage = (function () {
+    try {
+      const s = folium && folium.storage;
+      if (s && typeof s.get === 'function' && typeof s.set === 'function') return s;
+    } catch (e) {
+      /* ignored */
     }
-  } catch (e) {
-    /* ignored */
-  }
+    return null;
+  })();
 
   const state = {
     cfg: { enabled: true, ids: null },
@@ -128,83 +131,6 @@ export default function activate(folium) {
       if (folium.log && typeof folium.log.info === 'function') folium.log.info('[random-pool-plus] ' + text);
     } catch (e) {
       /* ignored */
-    }
-  }
-
-  // ---------- 运行诊断（只写 localStorage，便于排查；失败不影响功能） ----------
-  function dump(key, value) {
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.setItem('random-pool-plus.' + key, JSON.stringify(value));
-      }
-    } catch (e) {
-      /* ignored */
-    }
-  }
-
-  function dumpModes() {
-    const list = state.modes.map((m) => ({ id: m.id, kind: m.kind, label: m.label }));
-    dump('modes', { at: new Date().toISOString(), count: list.length, diag: state.diag, list });
-  }
-
-  function dumpEnv() {
-    try {
-      const info = {
-        at: new Date().toISOString(),
-        foliumKeys: Object.keys(folium || {}),
-        host: folium && folium.host ? folium.host : null,
-        registries: folium && folium.registries ? Object.keys(folium.registries) : null,
-        tabs: (function () {
-          try {
-            const t = folium.registries && folium.registries.playerPanelTabs;
-            if (!t) return 'no playerPanelTabs';
-            const via = t.list || t.getAll || t.values || t.all || t.entries || t.ids;
-            if (typeof via !== 'function') return 'no list api: ' + Object.keys(t).join(',');
-            const arr = via.call(t);
-            const ids = (Array.isArray(arr) ? arr : []).map(function (x) {
-              return typeof x === 'string' ? x : x && (x.id || x.name);
-            });
-            return ids;
-          } catch (e) {
-            return 'tabs dump err: ' + errText(e);
-          }
-        })(),
-        winFoliaKeys: Object.keys(window).filter(function (k) {
-          return /foli|mod|ipc|bridge/i.test(k);
-        })
-      };
-      dump('env', info);
-    } catch (e) {
-      /* ignored */
-    }
-  }
-
-  // 一次性探针：确认宿主真的接受把样式切到模组样式（结果写入 localStorage 的 probe 键）
-  function probeMod() {
-    try {
-      const modIds = state.modes.filter((m) => m.kind === 'mod').map((m) => m.id);
-      if (!modIds.length) {
-        dump('probe', { at: new Date().toISOString(), ok: false, why: 'pool has no mod style' });
-        return;
-      }
-      const target = modIds[0];
-      const r = V.setMode(target);
-      const finish = (err) => {
-        dump('probe', {
-          at: new Date().toISOString(),
-          id: target,
-          ok: !err,
-          error: err ? errText(err) : null,
-          modIds
-        });
-      };
-      if (isThenable(r)) {
-        r.then(() => finish(null), (e) => finish(e));
-        return;
-      }
-      finish(null);
-    } catch (e) {
-      dump('probe', { at: new Date().toISOString(), ok: false, error: errText(e) });
     }
   }
 
@@ -230,33 +156,45 @@ export default function activate(folium) {
     return out;
     }
 
-  // 宿主 registries.visualizers 兜底取列表（形状不确定，按常见几种取法试）
-  function registryModes() {
+  function refreshModes() {
+    state.lastRefresh = Date.now();
+    let raw;
     try {
-      const reg = folium.registries && folium.registries.visualizers;
-      if (!reg) return [];
-      const names = ['list', 'all', 'entries', 'values', 'ids', 'getAll'];
-      for (let i = 0; i < names.length; i += 1) {
-        const fn = reg[names[i]];
-        if (typeof fn !== 'function') continue;
-        const got = fn.call(reg);
-        if (isThenable(got)) continue;
-        if (Array.isArray(got)) return got;
-        if (got && typeof got === 'object') {
-          const keys = Object.keys(got);
-          if (keys.length) return keys.map((k) => got[k] || { id: k });
-        }
-      }
+      raw = V.listModes();
     } catch (e) {
-      state.diag = 'registries 兜底失败: ' + errText(e);
+      state.diag = 'listModes 抛错: ' + errText(e);
+      applyList([]);
+      return;
     }
-    return [];
+    if (isThenable(raw)) {
+      raw.then(
+        (v) => {
+          if (Array.isArray(v)) {
+            if (v.length === 0) state.diag = 'listModes 返回空数组';
+            applyList(v);
+          } else {
+            state.diag = 'listModes Promise 返回 ' + typeof v;
+            applyList([]);
+          }
+        },
+        (e) => {
+          state.diag = 'listModes Promise 失败: ' + errText(e);
+          applyList([]);
+        }
+      );
+      return;
+    }
+    if (Array.isArray(raw)) {
+      if (raw.length === 0) state.diag = 'listModes 返回空数组';
+      applyList(raw);
+      return;
+    }
+    state.diag = 'listModes 返回 ' + (raw === null ? 'null' : typeof raw);
+    applyList([]);
   }
-
   function applyList(arr) {
     state.modes = normalize(arr);
     state.ready = true;
-    dumpModes();
     if (state.rerender) {
       try {
         state.rerender();
@@ -273,48 +211,6 @@ export default function activate(folium) {
       state.refreshTimer = null;
       refreshModes();
     }, ms == null ? 1500 : ms);
-  }
-
-  function refreshModes() {
-    state.lastRefresh = Date.now();
-    let raw;
-    try {
-      raw = V.listModes();
-    } catch (e) {
-      state.diag = 'listModes 抛错: ' + errText(e);
-      const fb = registryModes();
-      applyList(fb);
-      return;
-    }
-    if (isThenable(raw)) {
-      raw.then(
-        (v) => {
-          if (Array.isArray(v)) applyList(v);
-          else {
-            state.diag = 'listModes Promise 返回 ' + typeof v;
-            applyList(registryModes());
-          }
-        },
-        (e) => {
-          state.diag = 'listModes Promise 失败: ' + errText(e);
-          applyList(registryModes());
-        }
-      );
-      return;
-    }
-    if (Array.isArray(raw)) {
-      if (raw.length === 0) {
-        const fb = registryModes();
-        if (fb.length) state.diag = 'listModes 为空，改用 registries.visualizers（' + fb.length + ' 项）';
-        else state.diag = 'listModes 返回空数组';
-        applyList(fb);
-      } else {
-        applyList(raw);
-      }
-      return;
-    }
-    state.diag = 'listModes 返回 ' + (raw === null ? 'null' : typeof raw);
-    applyList(registryModes());
   }
 
   function refreshCurrent() {
@@ -370,19 +266,34 @@ export default function activate(folium) {
 
   function saveCfg() {
     const payload = { enabled: state.cfg.enabled, ids: state.cfg.ids };
+    if (!storage) return;
     try {
-      window.localStorage.setItem(CONFIG_KEY, JSON.stringify(payload));
+      const p = storage.set(STORE_KEY, payload);
+      if (isThenable(p)) p.then(null, (e) => log('save failed: ' + errText(e)));
     } catch (e) {
       log('save failed: ' + errText(e));
     }
   }
 
   function loadCfg() {
+    if (!storage) return;
+    const finish = (raw) => {
+      state.cfg = normalizeCfg(raw);
+      if (state.rerender) {
+        try {
+          state.rerender();
+        } catch (e) {
+          /* ignored */
+        }
+      }
+      notify();
+    };
     try {
-      const raw = window.localStorage.getItem(CONFIG_KEY);
-      if (raw) state.cfg = normalizeCfg(JSON.parse(raw));
+      const got = storage.get(STORE_KEY);
+      if (isThenable(got)) got.then(finish, (e) => log('load failed: ' + errText(e)));
+      else finish(got);
     } catch (e) {
-      /* 用默认值 */
+      log('load failed: ' + errText(e));
     }
   }
 
@@ -479,7 +390,6 @@ export default function activate(folium) {
       state.hist = Array.isArray(state.hist) ? state.hist : [];
       state.hist.push(rec);
       if (state.hist.length > 12) state.hist.shift();
-      dump('hist', { at: new Date().toISOString(), list: state.hist });
     } catch (e) {
       /* ignored */
     }
@@ -654,15 +564,6 @@ export default function activate(folium) {
 
   // ---------- 播放器面板 ----------
   function renderPanel(container) {
-    try {
-      dump('mount', {
-        at: new Date().toISOString(),
-        modes: state.modes.length,
-        pool: poolIds().length
-      });
-    } catch (e) {
-      /* ignored */
-    }
     // 打开面板时若清单已陈旧（可能刚装了新样式），先重读一次再画
     if (!state.modes.length || Date.now() - (state.lastRefresh || 0) > 20000) {
       state.ready = false;
@@ -915,7 +816,6 @@ export default function activate(folium) {
   loadCfg();
   refreshModes();
   refreshCurrent();
-  dumpEnv();
   // 其它模组可能比本模组晚注册：稍后补读一次清单（之后每次切歌也会自动重读）
   try {
     setTimeout(() => {
